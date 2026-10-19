@@ -1,0 +1,30 @@
+const Module = require("module"); const path = require("path");
+const orig = Module._load;
+Module._load = function (req, parent, ...r) { if (/db\/prisma$/.test(req)) return { externalService: { findMany: async () => [] } }; return orig.call(this, req, parent, ...r); };
+const S = require(path.join(__dirname, "..", "src", "services", "externalServices.service.js"));
+const assert = require("assert"); let n = 0; const ok = (m, c) => { assert(c, "FAIL " + m); console.log("✓", m); n++; };
+const json = { data: { count: "3", items: [{ fine: 120000 }, { fine: 80000 }], clean: false, owner: "علی", nested: { points: "7" } } };
+ok("dot + [0] paths", S.getAt(json, "data.items[1].fine") === 80000 && S.getAt(json, "data.items.0.fine") === 120000);
+ok("number from numeric string", S.extract(json, { path: "data.count" }).value === 3);
+ok("count of an array", S.extract(json, { path: "data.items", type: "count" }).value === 2);
+ok("boolean / text", S.extract(json, { path: "data.clean", type: "boolean" }).value === false && S.extract(json, { path: "data.owner", type: "text" }).value === "علی");
+ok("missing path → clear error", !S.extract(json, { path: "data.x.y" }).ok && /data\.x\.y/.test(S.extract(json, { path: "data.x.y" }).error));
+ok("non-numeric text rejected as number", !S.extract(json, { path: "data.owner" }).ok);
+ok("placeholders", S.render('{"id":"{{nationalId}}","b":"{{birthDate}}"}', { nationalId: "0012345678", birthDate: "1371/5/12" }) === '{"id":"0012345678","b":"1371/5/12"}');
+const cfg = { baseUrl: "https://api.example.ir/v2/fines", method: "GET", authType: "query", authName: "key", apiKey: "SECRET123", nationalIdParam: "nid" };
+const r = S.buildRequest(cfg, { nationalId: "0012345678" }); const pv = S.previewOf(cfg, r);
+ok("simple mode keeps nationalIdParam; key is masked in the preview", r.url.searchParams.get("nid") === "0012345678" && r.url.searchParams.get("key") === "SECRET123" && !pv.url.includes("SECRET123"));
+const r2 = S.buildRequest({ baseUrl: "https://x.ir/a", method: "POST", authType: "basic", apiKey: "u:p", headers: [{ name: "X-Tenant", value: "t-{{nationalId}}" }], bodyTemplate: '{"nid":"{{nationalId}}"}', queryParams: [{ name: "v", value: "2" }] }, { nationalId: "0012345678" });
+ok("POST: basic auth, custom header, templated body, query param", r2.headers.Authorization === "Basic " + Buffer.from("u:p").toString("base64") && r2.headers["X-Tenant"] === "t-0012345678" && r2.body === '{"nid":"0012345678"}' && r2.url.searchParams.get("v") === "2");
+ok("Authorization header is masked in the console preview", S.previewOf({ apiKey: "u:p", authType: "basic", method: "POST" }, r2).headers.Authorization === "••••••••");
+ok("private IPs are blocked", ["127.0.0.1", "10.1.2.3", "192.168.1.5", "172.20.0.1", "169.254.169.254", "::1", "fd00::1"].every(S.isPrivateIp) && !S.isPrivateIp("8.8.8.8") && !S.isPrivateIp("172.32.0.1"));
+(async () => {
+  let blocked = 0; for (const u of ["http://localhost:3000/x", "http://127.0.0.1/x", "http://169.254.169.254/latest", "http://[::1]/x", "ftp://x.ir"]) { try { await S.assertSafeUrl(new URL(u)); } catch { blocked++; } }
+  ok("SSRF guard rejects localhost / loopback / cloud-metadata / ipv6 / non-http", blocked === 5);
+  const imp = { enabled: true, output: "fines", mode: "per_unit", perUnit: 5, cap: 40 };
+  ok("score impact per unit with cap (3 ⇒ −15, 20 ⇒ −40, 0 ⇒ 0)", S.impactPoints(imp, { fines: 3 }).points === -15 && S.impactPoints(imp, { fines: 20 }).points === -40 && S.impactPoints(imp, { fines: 0 }).points === 0);
+  const th = { enabled: true, mode: "threshold", threshold: 2, points: 30, output: "x" };
+  ok("score impact threshold", S.impactPoints(th, { x: 2 }).points === -30 && S.impactPoints(th, { x: 1 }).points === 0);
+  ok("impact disabled ⇒ 0", S.impactPoints({ enabled: false }, { a: 9 }).points === 0);
+  console.log(n + " connector checks passed");
+})().catch((e) => { console.error("✗", e.message); process.exit(1); });

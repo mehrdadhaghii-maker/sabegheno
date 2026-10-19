@@ -1,0 +1,46 @@
+{
+  "name": "sabegheno-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "predev": "prisma db push && npm run prisma:seed",
+    "dev": "nodemon src/server.js",
+    "prestart": "prisma db push && npm run prisma:seed",
+    "start": "node src/server.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev --name init",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:studio": "prisma studio",
+    "prisma:seed": "node prisma/seed.js",
+    "seed:demo": "node prisma/seed-demo.js",
+    "audit:routes": "node scripts/audit-routes.js",
+    "auth:unlock": "node scripts/unlock-admin.js",
+    "retention:run": "node scripts/run-retention.js",
+    "security:audit": "npm audit --omit=dev",
+    "test:logic": "node tests/classification.test.js && node tests/security.test.js && node tests/facilities.test.js && node tests/rating.test.js && node tests/connector.test.js && node tests/payment.test.js && node tests/cheques.test.js && node tests/attachments.test.js && node tests/integration.test.js",
+    "auth:set-admin": "node scripts/set-admin.js",
+    "nid:backfill": "node scripts/backfill-national-ids.js",
+    "preflight": "node scripts/preflight.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.19.1",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^3.0.3",
+    "winston": "^3.13.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4",
+    "prisma": "^5.19.1"
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
+  }
+}

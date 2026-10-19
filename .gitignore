@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+.env.production
+backend/.env
+frontend/.env
+admin/.env
+backend/logs
+backend/uploads

@@ -1,0 +1,636 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BusinessStatus {
+  pending_docs
+  pending_contract
+  approved
+  suspended
+  rejected
+}
+
+enum IntegrationType {
+  batch
+  realtime
+}
+
+enum ProviderStatus {
+  connected
+  degraded
+  disconnected
+}
+
+enum EventType {
+  inquiry
+  commitment_created
+  settled
+  delay
+  bounced_check
+  bad_debt
+}
+
+enum DecisionStatus {
+  approve
+  review
+  decline
+}
+
+enum RiskLevel {
+  low
+  medium
+  high
+}
+
+// A business (Provider) account — the entity that logs in as "کسب‌وکار"
+// and only becomes fully active once docs are verified + contract signed.
+model Business {
+  id             String         @id @default(cuid())
+  name           String
+  mobile         String         @unique
+  status         BusinessStatus @default(pending_docs)
+  isVerified     Boolean        @default(false)
+  contractSigned Boolean        @default(false)
+  logoUrl        String?
+  rejectionReason String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  webhookUrl     String?                          // outbound events (HMAC-signed)
+  webhookSecretEnc String?
+  syncUrl        String?                          // we PULL settlement/installment status from this endpoint
+  syncKeyEnc     String?
+  lastSyncAt     DateTime?
+  lastSyncResult String?
+  showOnLanding  Boolean        @default(false)   // admin opt-in: logo + brand on the public landing page
+  contractVersion Int?                            // last contract template version this business accepted
+  brandName      String?        // required at sign-up (v16); shown to other businesses on overlap alerts
+  facilities     Facility[]
+  apiKeys        ApiKey[]
+  // --- data.md: retention ---
+  lastActiveAt   DateTime       @default(now())
+  deletedAt      DateTime?      // set => PII already scrubbed; hard-deleted 30 days later
+  deletionReason String?        // user | inactive
+
+  creditChecks CreditCheck[]
+  providerLink Provider?
+  tickets      SupportTicket[]
+  notifications Notification[]
+  customRules  CustomRule[]
+
+  @@map("businesses")
+}
+
+// Sabegheno's own platform administrators (not to be confused with
+// Ontime24's admin login) — the people who approve businesses and oversee
+// the whole system from the admin panel.
+model AdminUser {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  passwordChangedAt DateTime?
+  // --- auth.md: lock after 5 wrong passwords for 48h ---
+  failedLogins Int       @default(0)
+  lockedUntil  DateTime?
+  // --- security.md: optional TOTP 2FA (secret stored AES-256-GCM encrypted) ---
+  twoFactorEnabled  Boolean  @default(false)
+  twoFactorSecretEnc String?
+  twoFactorLastStep Int?     // blocks re-use of the same 30s code
+
+  @@map("admin_users")
+}
+
+// A registered data Provider (loans API, bounced-checks API, a BNPL
+// company, etc). One Provider can be linked to a Business account if that
+// business is itself a data provider (e.g. a BNPL company), otherwise
+// Providers are managed independently by admins.
+model Provider {
+  id              String          @id @default(cuid())
+  name            String
+  integrationType IntegrationType @default(batch)
+  status          ProviderStatus  @default(connected)
+  apiBaseUrl      String?
+  lastSyncAt      DateTime?
+  dataQuality     Int             @default(100)
+  latencyMs       Int             @default(0)
+  errorRate       Float           @default(0)
+
+  businessId String?   @unique
+  business   Business? @relation(fields: [businessId], references: [id])
+
+  events ProviderEvent[]
+
+  @@map("providers")
+}
+
+// End-user individuals who can log in with just a mobile number to view
+// their own report ("کاربر" role in the frontend).
+model EndUser {
+  id              String   @id @default(cuid())
+  mobile          String   @unique
+  nationalIdHash  String   @unique
+  nationalIdEnc   String?  // AES-256-GCM copy so the person's own ID can be shown back to them (and masked to admins)
+  createdAt       DateTime @default(now())
+  lastActiveAt    DateTime @default(now())
+  deletedAt       DateTime?
+  deletionReason  String?
+  cards           PaymentCard[]
+  payments        Payment[]
+
+  @@map("end_users")
+}
+
+// Every event a Provider reports about a person: a new commitment, it being
+// settled, a payment delay, a bounced check, or a bad-debt writeoff — and
+// critically, real-time credit *inquiries*, which is what powers anti-
+// stacking detection across providers.
+model ProviderEvent {
+  id             String    @id @default(cuid())
+  providerId     String
+  provider       Provider  @relation(fields: [providerId], references: [id])
+  nationalIdHash String
+  nationalIdEnc  String?   // AES-256-GCM; shown only to the business that reported it (masked to admins)
+  eventType      EventType
+  amount         Int       @default(0)
+  delayDays      Int       @default(0)
+  note           String?
+  createdAt      DateTime  @default(now())
+
+  @@index([nationalIdHash, createdAt])
+  @@map("provider_events")
+}
+
+// One credit-decision run for a given business + customer national ID.
+model CreditCheck {
+  id                    String         @id @default(cuid())
+  businessId            String
+  business              Business       @relation(fields: [businessId], references: [id])
+  nationalIdHash         String
+  requestedAmount       Int
+  termMonths            Int
+  score                 Int
+  confidence            Int
+  riskLevel             RiskLevel
+  decision              DecisionStatus
+  recommendedLimit      Int
+  recommendedTermMonths Int
+  overrideReason        String?
+  concurrentProviders   Int            @default(0)
+  totalExternalExposure Int            @default(0)
+  // Snapshot of loans/checks/exposure at decision time (identity data is NOT stored).
+  sources               Json?
+  // --- v16: "advanced validation" (manual review by our admins) ---
+  reviewedDecision      String?        // approve | decline — set by an admin for decision=review
+  reviewNote            String?
+  reviewedAt            DateTime?
+  via                   String         @default("panel")   // panel | api
+  nationalIdEnc         String?        // AES-256-GCM copy of the national ID the business typed
+  createdAt             DateTime       @default(now())
+
+  @@index([nationalIdHash])
+  @@index([businessId, createdAt])
+  @@map("credit_checks")
+}
+
+// A business's own auto-approval rule set (the "سیاست اعتباردهی" screen).
+// A single, platform-wide auto-approval policy — not per-business. Only
+// the admin panel can change this; every credit check (scoring.service.js)
+// reads it to decide the approve/review/decline thresholds. There is
+// always exactly one row; `singleton` exists only so Prisma has a stable
+// unique field to upsert against.
+model PolicyRule {
+  id               String   @id @default(cuid())
+  singleton        String   @unique @default("global")
+  minScore         Int      @default(700)
+  maxActiveBounced Int      @default(0)
+  maxDelayDays     Int      @default(30)
+  // --- extended global policy (v14) ---
+  reviewMinScore       Int     @default(550)   // below this => decline
+  overlapWindowHours   Int     @default(72)    // look-back for cross-business inquiries
+  overlapMinBusinesses Int     @default(1)     // other businesses needed to trigger the warning
+  overlapAction        String  @default("review") // review | decline
+  overlapLimitPercent  Int     @default(50)    // recommended limit multiplier when overlap fires
+  maxRequestedAmount   Int     @default(0)     // 0 = unlimited; above => forced review
+  maxExternalExposure  Int     @default(0)     // 0 = unlimited; above => forced review
+  blockOnBadDebt       Boolean @default(true)  // active defaulter anywhere => decline everywhere
+  updatedAt        DateTime @updatedAt
+
+  @@map("policy_rules")
+}
+
+// OTP codes for both Business and EndUser mobile login. Sabegheno
+// generates and verifies these itself — api.ir's SmsOTP (see
+// src/services/otp.service.js) is only used for delivery, so login never
+// depends on any single data-provider partner's own auth system.
+model OtpCode {
+  id        String   @id @default(cuid())
+  mobile    String
+  codeHash  String
+  expiresAt DateTime
+  consumedAt DateTime?
+  attempts  Int      @default(0)   // wrong guesses against THIS code; 5 => code is burned
+  createdAt DateTime @default(now())
+
+  @@index([mobile, expiresAt])
+  @@map("otp_codes")
+}
+
+
+// Per-business or platform-wide custom rule: "IF <metric> <op> <value> THEN <action>".
+// businessId = null applies to every business.
+model CustomRule {
+  id          String    @id @default(cuid())
+  businessId  String?
+  business    Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name        String
+  metric      String    // score | requestedAmount | activeBounced | overdueDays | concurrentBusinesses | externalExposure | badDebtCount | service:<key>
+  operator    String    // lt | lte | gt | gte | eq
+  value       Float
+  action      String    // decline | review | cap_limit | reduce_limit
+  actionValue Int?      // cap amount (cap_limit) or percent to keep (reduce_limit)
+  message     String?
+  enabled     Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([businessId, enabled])
+  @@map("custom_rules")
+}
+
+// Written at the START of every inquiry (before any slow external call) so two
+// businesses querying the same national ID at the same moment always see each other.
+model InquiryLog {
+  id             String   @id @default(cuid())
+  nationalIdHash String
+  businessId     String
+  createdAt      DateTime @default(now())
+
+  @@index([nationalIdHash, createdAt])
+  @@map("inquiry_logs")
+}
+
+// A national ID reported as defaulted/bounced by any business. While active it
+// blocks credit at EVERY business on the platform.
+model Defaulter {
+  id                   String    @id @default(cuid())
+  nationalIdHash       String
+  nationalIdEnc        String?   // AES-256-GCM; shown only to the reporting business (masked to admins)
+  reportedByBusinessId String
+  kind                 String    // bad_debt | bounced_check
+  amount               Int       @default(0)
+  reason               String?
+  status               String    @default("active") // active | settled
+  createdAt            DateTime  @default(now())
+  resolvedAt           DateTime?
+
+  @@index([nationalIdHash, status])
+  @@map("defaulters")
+}
+
+model SupportTicket {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  subject    String
+  category   String   @default("general")
+  priority   String   @default("normal") // low | normal | high
+  status     String   @default("open")   // open | answered | closed
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  messages   TicketMessage[]
+
+  @@index([status, updatedAt])
+  @@map("support_tickets")
+}
+
+model TicketMessage {
+  id        String        @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  sender    String        // business | admin
+  body      String
+  createdAt DateTime      @default(now())
+  attachments TicketAttachment[]
+
+  @@map("ticket_messages")
+}
+
+// One row per recipient so each business has its own read state.
+model Notification {
+  id         String    @id @default(cuid())
+  businessId String
+  business   Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  title      String
+  body       String
+  level      String    @default("info") // info | success | warning | danger
+  kind       String?   // e.g. "inquiry_reviewed" — lets the panel refresh the right screen
+  refId      String?   // the record the message is about (inquiry id) — the bell opens it
+  readAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([businessId, readAt])
+  @@map("notifications")
+}
+
+// Admin-connected third-party web service (traffic fines, licence negative points…).
+// The API key is stored AES-256-GCM encrypted and never returned to any client.
+model ExternalService {
+  id             String   @id @default(cuid())
+  key            String   @unique
+  name           String
+  description    String?
+  baseUrl        String
+  method         String   @default("GET")   // GET | POST
+  authType       String   @default("bearer") // bearer | header | query | none
+  authName       String?                      // header or query-param name
+  apiKeyEnc      String?
+  nationalIdParam String  @default("nationalId")
+  responsePath   String   @default("data.count") // dot-path to a numeric value in the JSON response
+  unit           String?
+  enabled        Boolean  @default(true)
+  status         String   @default("untested") // untested | connected | error
+  lastTestAt     DateTime?
+  lastError      String?
+  headersEnc     String?                     // JSON [{name,value}] encrypted (values may hold secrets)
+  queryParams    Json?                       // [{name,value}] — value may use {{nationalId}} {{birthDate}}
+  bodyTemplate   String?                     // POST JSON template with the same placeholders
+  outputs        Json?                       // [{key,label,path,type: number|boolean|text|count}]
+  scoreImpact    Json?                       // {enabled,output,mode: per_unit|threshold,perUnit,cap,threshold,points,label}
+  timeoutMs      Int      @default(6000)
+  category       String?
+  lastLatencyMs  Int?
+  lastStatusCode Int?
+  lastSample     String?                     // truncated, secret-masked response of the last test
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("external_services")
+}
+
+
+// ===== v15: security, sessions, monitoring =====
+// One ACTIVE session per account (auth.md). Access JWT lives 15 min; the opaque
+// refresh token is stored only as a SHA-256 hash and rotated on every use.
+model Session {
+  id              String    @id @default(cuid())
+  subjectRole     String    // admin | business | user
+  subjectId       String
+  refreshHash     String    @unique
+  ip              String?
+  userAgent       String?
+  createdAt       DateTime  @default(now())
+  lastActivityAt  DateTime  @default(now())
+  expiresAt       DateTime                    // absolute lifetime cap
+  revokedAt       DateTime?
+  revokedReason   String?   // logout | new_login | idle | password_change | account_deleted | admin
+
+  @@index([subjectRole, subjectId, revokedAt])
+  @@index([revokedAt, createdAt])
+  @@map("sessions")
+}
+
+// Audit trail of every login attempt (success or failure) — auth.md reporting.
+model LoginAttempt {
+  id         String   @id @default(cuid())
+  role       String   // admin | business | user
+  identifier String   // admin username or masked mobile — never a password / OTP
+  success    Boolean
+  reason     String?  // bad_password | locked | bad_otp | otp_burned | bad_2fa | ok
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([identifier, createdAt])
+  @@index([createdAt])
+  @@map("login_attempts")
+}
+
+// data.md: a card is NEVER stored — only the gateway token and the last 4 digits.
+model PaymentCard {
+  id        String   @id @default(cuid())
+  userId    String
+  user      EndUser  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique   // issued by the payment gateway
+  last4     String
+  brand     String?
+  createdAt DateTime @default(now())
+
+  @@map("payment_cards")
+}
+
+// data.md §5: every cleanup run records how many rows it removed.
+model CleanupReport {
+  id        String   @id @default(cuid())
+  kind      String   // data_retention | log_retention
+  details   Json
+  total     Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([kind, createdAt])
+  @@map("cleanup_reports")
+}
+
+model ErrorLog {
+  id         String    @id @default(cuid())
+  message    String
+  stack      String?
+  route      String?
+  method     String?
+  userId     String?
+  statusCode Int?
+  meta       Json?
+  createdAt  DateTime  @default(now())
+  resolved   Boolean   @default(false)
+  resolvedAt DateTime?
+
+  @@index([createdAt])
+  @@index([statusCode])
+  @@index([resolved])
+  @@map("error_logs")
+}
+
+model RequestLog {
+  id         String   @id @default(cuid())
+  method     String
+  route      String
+  statusCode Int
+  duration   Int      // ms
+  ip         String?
+  userId     String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([statusCode])
+  @@map("request_logs")
+}
+
+
+// ===== v16: facilities, API keys, report payments =====
+// One row per credit a business has granted to a person ("هر اعتبار یک ردیف").
+// Status (current / overdue / delinquent / doubtful / settled) is COMPUTED from dueDate + settledAt,
+// never stored, so it can not go stale. Customers are keyed by hashed national ID only.
+model Facility {
+  id              String    @id @default(cuid())
+  businessId      String
+  business        Business  @relation(fields: [businessId], references: [id])
+  nationalIdHash  String
+  nationalIdEnc   String?                 // AES-256-GCM; shown only to the business that registered it (masked to admins)
+  title           String?                 // e.g. "خرید اقساطی گوشی"
+  externalRef     String?                 // the business's own id — lets the API upsert / settle without our ids
+  amount          Int                     // granted amount (toman)
+  disbursedAt     DateTime
+  dueDate         DateTime
+  remainingAmount Int
+  penaltyAmount   Int       @default(0)   // late-payment penalty reported by the business
+  settledAt       DateTime?
+  source          String    @default("panel")   // panel | api
+  lastSyncedAt    DateTime  @default(now())     // last time the business confirmed this row
+  staleNotifiedAt DateTime?
+  installments    Installment[]
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([businessId, externalRef])
+  @@index([nationalIdHash])
+  @@index([businessId, settledAt])
+  @@map("facilities")
+}
+
+// Server-to-server credentials. Only the SHA-256 of the key is stored; the full key is shown once.
+model ApiKey {
+  id         String    @id @default(cuid())
+  businessId String
+  business   Business  @relation(fields: [businessId], references: [id])
+  name       String
+  prefix     String                       // first characters, so the owner can recognise the key
+  keyHash    String    @unique
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([businessId, revokedAt])
+  @@map("api_keys")
+}
+
+// A natural person pays to see their own report (after OTP + Shahkar mobile↔national-ID match).
+model Payment {
+  id        String    @id @default(cuid())
+  userId    String
+  user      EndUser   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount    Int                          // toman
+  gateway   String                       // zarinpal | mock
+  authority String    @unique
+  refId     String?
+  status    String    @default("pending")  // pending | paid | failed
+  createdAt DateTime  @default(now())
+  paidAt    DateTime?
+  usedAt    DateTime?                      // one payment = ONE inquiry (15,000 toman each)
+  reportSnapshot Json?                     // the generated report, so a page reload does not charge again
+
+  @@index([userId, status])
+  @@map("payments")
+}
+
+
+// ===== v17: installments (bank-style ledger) and contract templates =====
+
+// One row per installment of a Facility. A facility with a schedule leaves the active ledger
+// automatically when its LAST installment is paid (like a loan leaving SAMAT on settlement).
+model Installment {
+  id         String    @id @default(cuid())
+  facilityId String
+  facility   Facility  @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+  seq        Int
+  dueDate    DateTime
+  amount     Int
+  paidAt     DateTime?
+  paidAmount Int?
+
+  @@unique([facilityId, seq])
+  @@index([facilityId, paidAt])
+  @@map("installments")
+}
+
+// The contract every business signs. The highest active version is "the contract";
+// publishing a new one replaces it for ALL businesses at once.
+model ContractTemplate {
+  id              String   @id @default(cuid())
+  version         Int      @unique
+  title           String
+  fileName        String
+  mime            String
+  sizeBytes       Int
+  storedName      String
+  note            String?
+  requireReaccept Boolean  @default(true)
+  isActive        Boolean  @default(false)
+  createdBy       String?
+  createdAt       DateTime @default(now())
+
+  @@map("contract_templates")
+}
+
+
+// ===== v18: in-transit cheques, ticket attachments, webhook outbox =====
+
+// A post-dated cheque a person has issued ("چک در راه"). Whoever is about to accept a cheque can see how many
+// cheques the issuer has already put into circulation. Status feeds the issuer's rating.
+model IssuedCheque {
+  id              String    @id @default(cuid())
+  businessId      String
+  nationalIdHash  String
+  nationalIdEnc   String?
+  externalRef     String?
+  amount          Int
+  issuedAt        DateTime
+  dueDate         DateTime
+  status          String    @default("pending")   // pending | cashed | bounced | cancelled
+  resolvedAt      DateTime?
+  lastSyncedAt    DateTime  @default(now())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([businessId, externalRef])
+  @@index([nationalIdHash, status])
+  @@index([businessId, status])
+  @@map("issued_cheques")
+}
+
+model TicketAttachment {
+  id           String         @id @default(cuid())
+  messageId    String?
+  message      TicketMessage? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  uploaderRole String
+  uploaderId   String
+  fileName     String
+  mime         String
+  sizeBytes    Int
+  storedName   String
+  createdAt    DateTime       @default(now())
+
+  @@index([messageId])
+  @@index([uploaderId, messageId])
+  @@map("ticket_attachments")
+}
+
+// Outbox: events for businesses that registered a webhook. A worker delivers and retries them.
+model WebhookDelivery {
+  id            String    @id @default(cuid())
+  businessId    String
+  event         String
+  payload       Json
+  status        String    @default("pending")   // pending | delivered | failed
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  deliveredAt   DateTime?
+
+  @@index([status, nextAttemptAt])
+  @@index([businessId, createdAt])
+  @@map("webhook_deliveries")
+}

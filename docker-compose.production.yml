@@ -1,0 +1,113 @@
+name: sabegheno
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: sabegheno_db
+    restart: always
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sabeghoono_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:-sabeghoono_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sabegheno_api
+    restart: always
+    logging: *logging
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sabeghoono_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sabeghoono_db}?schema=public
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env.production}
+      NATIONAL_ID_SALT: ${NATIONAL_ID_SALT:?Set NATIONAL_ID_SALT in .env.production}
+      API_IR_BASE_URL: ${API_IR_BASE_URL:-https://s.api.ir}
+      API_IR_KEY: ${API_IR_KEY:-}
+      API_IR_TIMEOUT_MS: ${API_IR_TIMEOUT_MS:-15000}
+      ONTIME24_BASE_URL: ${ONTIME24_BASE_URL:-}
+      ONTIME24_ADMIN_USERNAME: ${ONTIME24_ADMIN_USERNAME:-}
+      ONTIME24_ADMIN_PASSWORD: ${ONTIME24_ADMIN_PASSWORD:-}
+      ADMIN_DEFAULT_USERNAME: ${ADMIN_DEFAULT_USERNAME:-admin}
+      # Must satisfy the password policy (8+ chars, upper+lower+digit+symbol). If empty/weak the seed
+      # generates a random one and prints it ONCE in the api container log.
+      ADMIN_DEFAULT_PASSWORD: ${ADMIN_DEFAULT_PASSWORD:-}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env.production (encrypts third-party API keys)}
+      UPLOAD_DIR: /data/uploads
+      # --- v15 security / monitoring ---
+      TRUST_PROXY: ${TRUST_PROXY:-2}            # host nginx → container nginx → api = 2 proxies (real client IP for rate limits)
+      CORS_ORIGINS: ${CORS_ORIGINS:-}           # empty = same-origin only (the nginx /api proxy); list origins only if you call the API cross-origin
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-30}
+      RATE_LIMIT_API_MAX: ${RATE_LIMIT_API_MAX:-300}
+      RATE_LIMIT_AUTH_MAX: ${RATE_LIMIT_AUTH_MAX:-20}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      ADMIN_PANEL_URL: ${ADMIN_PANEL_URL:-}
+      # --- v16: paid self-report (Zarinpal). Empty merchant id = payments disabled in production ---
+      FRONTEND_URL: ${FRONTEND_URL:-https://app.sabegheno.ir}   # where the gateway sends the browser back (business panel host)
+      ZARINPAL_MERCHANT_ID: ${ZARINPAL_MERCHANT_ID:-}
+      REPORT_PRICE_TOMAN: ${REPORT_PRICE_TOMAN:-15000}
+    volumes:
+      - uploads_data:/data/uploads   # business logos survive container rebuilds
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sabegheno_frontend
+    restart: always
+    logging: *logging
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - api
+
+  landing:
+    build:
+      context: ./landing
+      dockerfile: Dockerfile
+    container_name: sabegheno_landing
+    restart: always
+    logging: *logging
+    depends_on:
+      - api   # nginx resolves the api host at start-up (partner list + logos)
+    ports:
+      - "127.0.0.1:3002:80"
+
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    container_name: sabegheno_admin
+    restart: always
+    logging: *logging
+    ports:
+      - "127.0.0.1:3001:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  uploads_data:
